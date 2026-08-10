@@ -64,19 +64,17 @@ the native library.
 
 ### Demo
 
-`LowLevelDemo/` drives MuJoCo from these bindings and renders the simulation with the
-[Evergine](https://evergine.com/) low-level graphics API — a headless DirectX 11 device writing into
-an offscreen framebuffer, one draw per geom through a dynamic-offset constant buffer. Frames are read
-back from the GPU and piped to `ffmpeg` as H.264.
-
-[**mujoco-lowlevel-demo.mp4**](LowLevelDemo/media/mujoco-lowlevel-demo.mp4) — 30 bodies (boxes,
-spheres and capsules) dropped in three waves while the camera orbits the pile.
+`LowLevelDemo/` drives MuJoCo from these bindings and renders the simulation live with the
+[Evergine](https://evergine.com/) low-level graphics API — a DirectX 11 device presenting to a swap
+chain, one draw per geom through a dynamic-offset constant buffer. 30 bodies (boxes, spheres and
+capsules) drop in three waves while the camera orbits the pile; the simulation restarts every 10
+seconds.
 
 ```bash
 dotnet run --project LowLevelDemo/LowLevelDemo.csproj
 ```
 
-Requires `ffmpeg` on `PATH` for the video; pass `--png` to write still frames instead.
+[**mujoco-lowlevel-demo.mp4**](LowLevelDemo/media/mujoco-lowlevel-demo.mp4) is a recording of it.
 
 ### String parameters
 

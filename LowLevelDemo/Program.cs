@@ -2,9 +2,8 @@ using Evergine.Bindings.MuJoCo;
 using Evergine.Common.Graphics;
 using Evergine.Common.Graphics.VertexFormats;
 using Evergine.DirectX11;
+using Evergine.Forms;
 using Evergine.Mathematics;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.PixelFormats;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -17,19 +16,16 @@ using Rectangle = Evergine.Mathematics.Rectangle;
 namespace LowLevelDemo
 {
 	/// <summary>
-	/// Headless demo: MuJoCo simulates bodies dropped in three waves; the Evergine low-level
-	/// graphics API renders every geom into an offscreen framebuffer; frames are read back and
-	/// piped to ffmpeg as an H.264 MP4.
-	/// Rendering follows the engine's VisualTests.LowLevel patterns (DrawCubeTest,
-	/// RenderToTextureTest, MultithreadingTest) and the Evergine.Graphics.Tests readback pattern.
+	/// Real-time demo: MuJoCo simulates bodies dropped in three waves while the Evergine low-level
+	/// graphics API renders every geom straight into the swap chain.
+	/// Follows the engine's VisualTests.LowLevel patterns: DesktopUtils/VisualTestDefinition for the
+	/// window and swap chain, DrawCubeTest for the pipeline, MultithreadingTest for the per-object
+	/// dynamic-offset constant buffer.
 	/// </summary>
 	unsafe class Program
 	{
-		private const uint Width = 1280;
-		private const uint Height = 720;
 		private const uint CbSlotSize = 256; // per-geom constant slot, 256-byte aligned
-		private const int Fps = 60;
-		private const double DurationSeconds = 8.0;
+		private const double LoopSeconds = 10.0;
 
 		/// <summary>
 		/// Release time per wave. Waves 2 and 3 wait frozen at z ~6, well above the camera frustum,
@@ -44,8 +40,7 @@ namespace LowLevelDemo
 			  <option timestep="0.002" iterations="50"/>
 			  <worldbody>
 			    <light pos="0 0 10"/>
-			    <!-- generous floor: strays bouncing off a smaller plane fall into the void and read
-			         as a rendering glitch in the recording -->
+			    <!-- generous floor: strays bouncing off a smaller plane fall into the void -->
 			    <geom name="floor" type="plane" size="7 7 0.1" rgba="0.72 0.70 0.66 1"/>
 
 			    <!-- wave 1 -->
@@ -102,10 +97,31 @@ namespace LowLevelDemo
 			public uint IndexCount;
 		}
 
-		private static GraphicsContext graphics;
 		private static readonly Dictionary<string, Mesh> meshes = new();
 
-		static int Main(string[] args)
+		private static GraphicsContext graphics;
+		private static SwapChain swapChain;
+		private static Window window;
+		private static FrameBuffer frameBuffer;
+		private static bool surfaceResized;
+
+		private static CommandQueue commandQueue;
+		private static GraphicsPipelineState pipeline;
+		private static ResourceSet resourceSet;
+		private static Buffer constantBuffer;
+		private static byte[] cbData;
+		private static Viewport[] viewports;
+		private static Rectangle[] scissors;
+		private static Matrix4x4 projection;
+
+		private static mjModel* model;
+		private static mjData* data;
+		private static Stopwatch clock;
+		private static double simulatedTime;
+		private static float cameraAngle;
+
+		[STAThread]
+		static int Main()
 		{
 			// ProjectReference scenario: wire runtimes/<rid>/native manually (NuGet consumers get
 			// this for free).
@@ -127,57 +143,66 @@ namespace LowLevelDemo
 				return NativeLibrary.Load(name, assembly, searchPath);
 			});
 
-			bool pngMode = Array.IndexOf(args, "--png") >= 0;
-			var positional = Array.FindAll(args, a => !a.StartsWith("--"));
-			var outputPath = positional.Length > 0
-				? positional[0]
-				: Path.Combine(FindRepoRoot(), "LowLevelDemo", "media", "mujoco-lowlevel-demo.mp4");
-
-			// ---- MuJoCo ----------------------------------------------------------------------
-			var xmlPath = Path.Combine(Path.GetTempPath(), "mujoco_lowleveldemo.xml");
-			File.WriteAllText(xmlPath, Scene);
-			var error = stackalloc byte[1024];
-			mjModel* m = MuJoCo.mj_loadXML(xmlPath, null, error, 1024);
-			File.Delete(xmlPath);
-
-			if (m == null)
+			if (!LoadModel())
 			{
-				Console.Error.WriteLine($"mj_loadXML: {Marshal.PtrToStringUTF8((IntPtr)error)}");
 				return 1;
 			}
 
-			mjData* d = MuJoCo.mj_makeData(m);
-			Console.WriteLine($"MuJoCo {Marshal.PtrToStringUTF8((IntPtr)MuJoCo.mj_versionString())}: ngeom={m->ngeom} nbody={m->nbody}");
+			// Window + swap chain, following DesktopUtils.Execute / VisualTestDefinition.
+			var windowSystem = new FormsWindowsSystem();
+			window = windowSystem.CreateWindow("MuJoCo.NET - Evergine low-level", 1280, 720);
+			window.OnScreenSizeChanged += (s, e) => surfaceResized = true;
 
-			// ---- Evergine low-level, headless (GraphicsTests pattern) --------------------------
+			var swapChainDescription = new SwapChainDescription()
+			{
+				Width = window.Width,
+				Height = window.Height,
+				SurfaceInfo = window.SurfaceInfo,
+				ColorTargetFormat = PixelFormat.R8G8B8A8_UNorm,
+				ColorTargetFlags = TextureFlags.RenderTarget | TextureFlags.ShaderResource,
+				DepthStencilTargetFormat = PixelFormat.D24_UNorm_S8_UInt,
+				DepthStencilTargetFlags = TextureFlags.DepthStencil,
+				SampleCount = TextureSampleCount.None,
+				IsWindowed = true,
+				RefreshRate = 60,
+			};
+
 			graphics = new DX11GraphicsContext();
 			graphics.CreateDevice(new ValidationLayer(ValidationLayer.NotifyMethod.Trace));
+			swapChain = graphics.CreateSwapChain(swapChainDescription);
+			swapChain.VerticalSync = true;
 
-			// Offscreen framebuffer (RenderToTextureTest pattern).
-			var colorDescription = new TextureDescription()
+			windowSystem.Run(Load, Draw);
+
+			MuJoCo.mj_deleteData(data);
+			MuJoCo.mj_deleteModel(model);
+			graphics.Dispose();
+			return 0;
+		}
+
+		private static bool LoadModel()
+		{
+			var xmlPath = Path.Combine(Path.GetTempPath(), "mujoco_lowleveldemo.xml");
+			File.WriteAllText(xmlPath, Scene);
+
+			var error = stackalloc byte[1024];
+			model = MuJoCo.mj_loadXML(xmlPath, null, error, 1024);
+			File.Delete(xmlPath);
+
+			if (model == null)
 			{
-				Format = PixelFormat.R8G8B8A8_UNorm,
-				Width = Width,
-				Height = Height,
-				Depth = 1,
-				ArraySize = 1,
-				Flags = TextureFlags.RenderTarget | TextureFlags.ShaderResource,
-				CpuAccess = ResourceCpuAccess.None,
-				MipLevels = 1,
-				Type = TextureType.Texture2D,
-				Usage = ResourceUsage.Default,
-				SampleCount = TextureSampleCount.None,
-			};
-			var colorTarget = graphics.Factory.CreateTexture(ref colorDescription);
+				System.Windows.Forms.MessageBox.Show(
+					Marshal.PtrToStringUTF8((IntPtr)error), "mj_loadXML failed");
+				return false;
+			}
 
-			var depthDescription = colorDescription;
-			depthDescription.Format = PixelFormat.D24_UNorm_S8_UInt;
-			depthDescription.Flags = TextureFlags.DepthStencil;
-			var depthTarget = graphics.Factory.CreateTexture(ref depthDescription);
+			data = MuJoCo.mj_makeData(model);
+			return true;
+		}
 
-			var frameBuffer = graphics.Factory.CreateFrameBuffer(
-				new FrameBufferAttachment(depthTarget, 0, 1),
-				new[] { new FrameBufferAttachment(colorTarget, 0, 1) });
+		private static void Load()
+		{
+			frameBuffer = swapChain.FrameBuffer;
 
 			// Shaders, compiled at runtime (TestHelpers.ReadAndCompileShader pattern).
 			var vsBytes = graphics.ShaderCompile(Shaders.Hlsl, "VS", ShaderStages.Vertex).ByteCode;
@@ -189,10 +214,12 @@ namespace LowLevelDemo
 
 			// One big dynamic-offset constant buffer, one 256-byte slot per geom
 			// (MultithreadingTest pattern).
-			int ngeom = (int)m->ngeom;
+			int ngeom = (int)model->ngeom;
+			cbData = new byte[CbSlotSize * ngeom];
+
 			var cbDescription = new BufferDescription(
 				CbSlotSize * (uint)ngeom, BufferFlags.ConstantBuffer, ResourceUsage.Default);
-			var constantBuffer = graphics.Factory.CreateBuffer(ref cbDescription);
+			constantBuffer = graphics.Factory.CreateBuffer(ref cbDescription);
 
 			var layoutDescription = new ResourceLayoutDescription(
 				new LayoutElementDescription(0, ResourceType.ConstantBuffer,
@@ -200,7 +227,7 @@ namespace LowLevelDemo
 			var resourceLayout = graphics.Factory.CreateResourceLayout(ref layoutDescription);
 
 			var resourceSetDescription = new ResourceSetDescription(resourceLayout, constantBuffer);
-			var resourceSet = graphics.Factory.CreateResourceSet(ref resourceSetDescription);
+			resourceSet = graphics.Factory.CreateResourceSet(ref resourceSetDescription);
 
 			var pipelineDescription = new GraphicsPipelineDescription()
 			{
@@ -220,135 +247,110 @@ namespace LowLevelDemo
 				},
 				Outputs = frameBuffer.OutputDescription,
 			};
-			var pipeline = graphics.Factory.CreateGraphicsPipeline(ref pipelineDescription);
-			var commandQueue = graphics.Factory.CreateCommandQueue();
+			pipeline = graphics.Factory.CreateGraphicsPipeline(ref pipelineDescription);
+			commandQueue = graphics.Factory.CreateCommandQueue();
 
-			var proj = Matrix4x4.CreatePerspectiveFieldOfView(
-				MathHelper.PiOver4, (float)Width / Height, 0.1f, 100f, reverseDepthBuffer: true);
+			UpdateSurfaceSize(window.Width, window.Height);
+			clock = Stopwatch.StartNew();
+		}
 
-			var viewports = new Viewport[] { new Viewport(0, 0, Width, Height) };
-			var scissors = new Rectangle[] { new Rectangle(0, 0, (int)Width, (int)Height) };
+		private static void UpdateSurfaceSize(uint width, uint height)
+		{
+			viewports = new Viewport[] { new Viewport(0, 0, width, height) };
+			scissors = new Rectangle[] { new Rectangle(0, 0, (int)width, (int)height) };
+			projection = Matrix4x4.CreatePerspectiveFieldOfView(
+				MathHelper.PiOver4, (float)width / height, 0.1f, 100f, reverseDepthBuffer: true);
+		}
 
-			var cbData = new byte[CbSlotSize * ngeom];
-			int totalFrames = (int)(DurationSeconds * Fps);
-
-			// ---- Record -----------------------------------------------------------------------
-			Directory.CreateDirectory(Path.GetDirectoryName(outputPath));
-
-			using var grabber = new FrameGrabber(colorTarget);
-			FfmpegEncoder encoder = null;
-
-			if (!pngMode)
+		private static void Draw()
+		{
+			if (surfaceResized)
 			{
-				encoder = FfmpegEncoder.Start(outputPath, Width, Height, Fps);
-				Console.WriteLine($"recording {totalFrames} frames -> {outputPath}");
+				surfaceResized = false;
+				swapChain.ResizeSwapChain(window.Width, window.Height);
+				frameBuffer = swapChain.FrameBuffer;
+				UpdateSurfaceSize(window.Width, window.Height);
 			}
 
-			var stopwatch = Stopwatch.StartNew();
+			swapChain.InitFrame();
 
-			for (int frame = 0; frame < totalFrames; frame++)
+			var elapsed = clock.Elapsed.TotalSeconds;
+			clock.Restart();
+
+			// Clamp the step so a stall (dragging the window, a breakpoint) cannot make the solver
+			// chew through thousands of steps in one frame.
+			simulatedTime += Math.Min(elapsed, 0.05);
+			cameraAngle += (float)(elapsed * 0.25);
+
+			if (simulatedTime >= LoopSeconds)
 			{
-				double targetTime = frame / (double)Fps;
-				while (d->time < targetTime)
-				{
-					HoldUnreleasedWaves(m, d);
-					MuJoCo.mj_step(m, d);
-				}
-
-				var viewProj = Matrix4x4.Multiply(GetOrbitView(frame, totalFrames), proj);
-				FillConstants(m, d, viewProj, cbData);
-				DrawFrame(commandQueue, frameBuffer, pipeline, resourceSet, constantBuffer, cbData, viewports, scissors, m);
-
-				if (pngMode)
-				{
-					if (frame % (totalFrames / 3) == 0)
-					{
-						var png = Path.ChangeExtension(outputPath, null) + $"_{d->time:F1}s.png";
-						SavePng(grabber.Grab(), png);
-						Console.WriteLine($"t={d->time:F2}s -> {png}");
-					}
-				}
-				else
-				{
-					encoder.WriteFrame(grabber.Grab());
-
-					if ((frame + 1) % 60 == 0)
-					{
-						Console.WriteLine($"  {frame + 1}/{totalFrames} frames (t={d->time:F2}s)");
-					}
-				}
+				MuJoCo.mj_resetData(model, data);
+				simulatedTime = 0;
 			}
 
-			encoder?.Finish();
-			stopwatch.Stop();
-
-			MuJoCo.mj_deleteData(d);
-			MuJoCo.mj_deleteModel(m);
-			graphics.Dispose();
-
-			if (!pngMode)
+			while (data->time < simulatedTime)
 			{
-				var size = new FileInfo(outputPath).Length / (1024.0 * 1024.0);
-				Console.WriteLine($"done in {stopwatch.Elapsed.TotalSeconds:F1}s -> {outputPath} ({size:F1} MB)");
+				HoldUnreleasedWaves();
+				MuJoCo.mj_step(model, data);
 			}
 
-			return 0;
+			var viewProj = Matrix4x4.Multiply(GetOrbitView(), projection);
+			FillConstants(viewProj);
+			DrawScene();
+
+			swapChain.Present();
 		}
 
 		/// <summary>
 		/// Pins every body of a wave that has not been released yet to its initial pose, so the
 		/// wave stays parked above the camera frustum until its release time.
 		/// </summary>
-		private static void HoldUnreleasedWaves(mjModel* m, mjData* d)
+		private static void HoldUnreleasedWaves()
 		{
 			for (int wave = 0; wave < WaveReleaseTime.Length; wave++)
 			{
-				if (d->time >= WaveReleaseTime[wave])
+				if (data->time >= WaveReleaseTime[wave])
 				{
 					continue;
 				}
 
 				int firstBody = 1 + (wave * BodiesPerWave); // body 0 is the world
-				for (int b = firstBody; b < firstBody + BodiesPerWave && b < m->nbody; b++)
+				for (int b = firstBody; b < firstBody + BodiesPerWave && b < model->nbody; b++)
 				{
-					int joint = m->body_jntadr[b];
+					int joint = model->body_jntadr[b];
 					if (joint < 0)
 					{
 						continue;
 					}
 
-					int qposAdr = m->jnt_qposadr[joint];
-					int dofAdr = m->jnt_dofadr[joint];
+					int qposAdr = model->jnt_qposadr[joint];
+					int dofAdr = model->jnt_dofadr[joint];
 
 					for (int k = 0; k < 7; k++)
 					{
-						d->qpos[qposAdr + k] = m->qpos0[qposAdr + k];
+						data->qpos[qposAdr + k] = model->qpos0[qposAdr + k];
 					}
 
 					for (int k = 0; k < 6; k++)
 					{
-						d->qvel[dofAdr + k] = 0;
+						data->qvel[dofAdr + k] = 0;
 					}
 				}
 			}
 		}
 
 		/// <summary>
-		/// Camera orbiting the pile: a 140 degree azimuth sweep while slowly closing in. The scene
-		/// stays in MuJoCo's Z-up coordinates, so Z is also the camera up vector.
+		/// Camera slowly orbiting the pile. The scene stays in MuJoCo's Z-up coordinates, so Z is
+		/// also the camera up vector.
 		/// </summary>
-		private static Matrix4x4 GetOrbitView(int frame, int totalFrames)
+		private static Matrix4x4 GetOrbitView()
 		{
-			float t = totalFrames > 1 ? frame / (float)(totalFrames - 1) : 0f;
-
-			float azimuth = MathHelper.ToRadians(-125f + (140f * t));
-			float radius = 4.0f - (1.0f * t);
-			float height = 1.9f - (0.5f * t);
+			const float radius = 3.6f;
 
 			var eye = new Vector3(
-				radius * MathF.Cos(azimuth),
-				radius * MathF.Sin(azimuth),
-				height);
+				radius * MathF.Cos(cameraAngle),
+				radius * MathF.Sin(cameraAngle),
+				1.7f);
 
 			return Matrix4x4.CreateLookAt(eye, new Vector3(0, 0, 0.5f), Vector3.UnitZ);
 		}
@@ -356,32 +358,32 @@ namespace LowLevelDemo
 		/// <summary>
 		/// Writes one PerObject slot per geom: world = scale · rotation(geom_xmat) · translation(geom_xpos).
 		/// </summary>
-		private static void FillConstants(mjModel* m, mjData* d, Matrix4x4 viewProj, byte[] cbData)
+		private static void FillConstants(Matrix4x4 viewProj)
 		{
 			fixed (byte* basePtr = cbData)
 			{
-				for (int g = 0; g < m->ngeom; g++)
+				for (int g = 0; g < model->ngeom; g++)
 				{
-					var world = BuildWorldMatrix(m, d, g);
+					var world = BuildWorldMatrix(g);
 
 					var slot = (PerObject*)(basePtr + (g * CbSlotSize));
 					slot->WorldViewProj = Matrix4x4.Multiply(world, viewProj);
 					slot->World = world;
 					slot->Color = new Vector4(
-						m->geom_rgba[(g * 4) + 0],
-						m->geom_rgba[(g * 4) + 1],
-						m->geom_rgba[(g * 4) + 2],
-						m->geom_rgba[(g * 4) + 3]);
+						model->geom_rgba[(g * 4) + 0],
+						model->geom_rgba[(g * 4) + 1],
+						model->geom_rgba[(g * 4) + 2],
+						model->geom_rgba[(g * 4) + 3]);
 				}
 			}
 		}
 
-		private static Matrix4x4 BuildWorldMatrix(mjModel* m, mjData* d, int g)
+		private static Matrix4x4 BuildWorldMatrix(int g)
 		{
-			int type = m->geom_type[g];
-			double* size = m->geom_size + (g * 3);
-			double* xpos = d->geom_xpos + (g * 3);
-			double* xmat = d->geom_xmat + (g * 9);
+			int type = model->geom_type[g];
+			double* size = model->geom_size + (g * 3);
+			double* xpos = data->geom_xpos + (g * 3);
+			double* xmat = data->geom_xmat + (g * 9);
 
 			// MuJoCo's xmat is a row-major rotation for column vectors; Evergine uses row vectors,
 			// so the transpose goes into M11..M33.
@@ -422,10 +424,10 @@ namespace LowLevelDemo
 			return local * rotation * translation;
 		}
 
-		private static Mesh GetMesh(mjModel* m, int g)
+		private static Mesh GetMesh(int g)
 		{
-			int type = m->geom_type[g];
-			double* size = m->geom_size + (g * 3);
+			int type = model->geom_type[g];
+			double* size = model->geom_size + (g * 3);
 
 			string key;
 			List<VertexPositionNormalTangentTexture> vertices;
@@ -489,16 +491,7 @@ namespace LowLevelDemo
 			return mesh;
 		}
 
-		private static void DrawFrame(
-			CommandQueue commandQueue,
-			FrameBuffer frameBuffer,
-			GraphicsPipelineState pipeline,
-			ResourceSet resourceSet,
-			Buffer constantBuffer,
-			byte[] cbData,
-			Viewport[] viewports,
-			Rectangle[] scissors,
-			mjModel* m)
+		private static void DrawScene()
 		{
 			var commandBuffer = commandQueue.CommandBuffer();
 			commandBuffer.Begin();
@@ -517,9 +510,9 @@ namespace LowLevelDemo
 			commandBuffer.SetGraphicsPipelineState(pipeline);
 
 			var offsets = new uint[1];
-			for (int g = 0; g < m->ngeom; g++)
+			for (int g = 0; g < model->ngeom; g++)
 			{
-				var mesh = GetMesh(m, g);
+				var mesh = GetMesh(g);
 				offsets[0] = (uint)g * CbSlotSize;
 				commandBuffer.SetResourceSet(resourceSet, 0, offsets);
 				commandBuffer.SetVertexBuffers(new[] { mesh.VertexBuffer });
@@ -533,194 +526,6 @@ namespace LowLevelDemo
 
 			commandQueue.Submit();
 			commandQueue.WaitIdle();
-		}
-
-		private static void SavePng(byte[] pixels, string path)
-		{
-			using var image = SixLabors.ImageSharp.Image.LoadPixelData<Rgba32>(pixels, (int)Width, (int)Height);
-			image.SaveAsPng(path);
-		}
-
-		private static string FindRepoRoot()
-		{
-			var current = new DirectoryInfo(AppContext.BaseDirectory);
-			while (current != null)
-			{
-				if (File.Exists(Path.Combine(current.FullName, "MuJoCoGen.sln")))
-				{
-					return current.FullName;
-				}
-
-				current = current.Parent;
-			}
-
-			return AppContext.BaseDirectory;
-		}
-
-		/// <summary>
-		/// GPU -> CPU frame readback. The staging texture, the command queue and the pixel buffer
-		/// are created once and reused: allocating them per frame is fine for a screenshot but
-		/// ruinous across hundreds of frames.
-		/// Pattern from Evergine.Graphics.Tests\TextureTests.cs and Evergine.Assets\SnapShoter.cs.
-		/// </summary>
-		private sealed class FrameGrabber : IDisposable
-		{
-			private readonly Texture source;
-			private readonly Texture staging;
-			private readonly CommandQueue queue;
-			private readonly byte[] pixels;
-			private readonly int width;
-			private readonly int height;
-
-			public FrameGrabber(Texture source)
-			{
-				this.source = source;
-				this.width = (int)source.Description.Width;
-				this.height = (int)source.Description.Height;
-				this.pixels = new byte[this.width * this.height * 4];
-
-				var stagingDescription = source.Description;
-				stagingDescription.Flags = TextureFlags.None;
-				stagingDescription.CpuAccess = ResourceCpuAccess.Read;
-				stagingDescription.Usage = ResourceUsage.Staging;
-				this.staging = graphics.Factory.CreateTexture(ref stagingDescription);
-
-				this.queue = graphics.Factory.CreateCommandQueue();
-			}
-
-			public byte[] Grab()
-			{
-				var command = this.queue.CommandBuffer();
-				command.Begin();
-				command.CopyTextureDataTo(this.source, this.staging);
-				command.End();
-				command.Commit();
-				this.queue.Submit();
-				this.queue.WaitIdle();
-
-				var mapped = graphics.MapMemory(this.staging, MapMode.Read);
-				try
-				{
-					int rowBytes = this.width * 4;
-					for (int y = 0; y < this.height; y++)
-					{
-						new Span<byte>((byte*)mapped.Data + (y * mapped.RowPitch), rowBytes)
-							.CopyTo(this.pixels.AsSpan(y * rowBytes, rowBytes));
-					}
-				}
-				finally
-				{
-					graphics.UnmapMemory(this.staging);
-				}
-
-				return this.pixels;
-			}
-
-			public void Dispose() => this.staging?.Dispose();
-		}
-
-		/// <summary>
-		/// Pipes raw RGBA frames into ffmpeg's stdin and lets it mux an H.264 MP4.
-		/// </summary>
-		private sealed class FfmpegEncoder
-		{
-			private readonly Process process;
-			private readonly Stream input;
-			private readonly Queue<string> stderrTail = new();
-
-			private FfmpegEncoder(Process process)
-			{
-				this.process = process;
-				this.input = process.StandardInput.BaseStream;
-			}
-
-			public static FfmpegEncoder Start(string outputPath, uint width, uint height, int fps)
-			{
-				var arguments =
-					$"-y -f rawvideo -pixel_format rgba -video_size {width}x{height} -framerate {fps} -i - " +
-					$"-c:v libx264 -preset medium -crf 18 -pix_fmt yuv420p -movflags +faststart \"{outputPath}\"";
-
-				foreach (var exe in CandidateExecutables())
-				{
-					var startInfo = new ProcessStartInfo(exe, arguments)
-					{
-						RedirectStandardInput = true,
-						RedirectStandardError = true,
-						UseShellExecute = false,
-						CreateNoWindow = true,
-					};
-
-					Process process;
-					try
-					{
-						process = Process.Start(startInfo);
-					}
-					catch (Exception)
-					{
-						continue;
-					}
-
-					var encoder = new FfmpegEncoder(process);
-
-					// ffmpeg is chatty on stderr; leaving that pipe unread deadlocks it once the
-					// buffer fills, which with hundreds of frames it certainly would.
-					process.ErrorDataReceived += (_, e) =>
-					{
-						if (e.Data == null)
-						{
-							return;
-						}
-
-						lock (encoder.stderrTail)
-						{
-							encoder.stderrTail.Enqueue(e.Data);
-							while (encoder.stderrTail.Count > 20)
-							{
-								encoder.stderrTail.Dequeue();
-							}
-						}
-					};
-					process.BeginErrorReadLine();
-
-					return encoder;
-				}
-
-				throw new InvalidOperationException(
-					"ffmpeg was not found on PATH nor at the known winget install location. " +
-					"Install it (winget install Gyan.FFmpeg) or run with --png.");
-			}
-
-			private static IEnumerable<string> CandidateExecutables()
-			{
-				yield return "ffmpeg";
-
-				yield return Path.Combine(
-					Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-					"Microsoft", "WinGet", "Packages",
-					"Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe",
-					"ffmpeg-8.0.1-full_build", "bin", "ffmpeg.exe");
-			}
-
-			public void WriteFrame(byte[] rgba) => this.input.Write(rgba, 0, rgba.Length);
-
-			public void Finish()
-			{
-				this.input.Flush();
-				this.input.Close();
-				this.process.WaitForExit();
-
-				if (this.process.ExitCode != 0)
-				{
-					string tail;
-					lock (this.stderrTail)
-					{
-						tail = string.Join(Environment.NewLine, this.stderrTail);
-					}
-
-					throw new InvalidOperationException(
-						$"ffmpeg exited with code {this.process.ExitCode}:{Environment.NewLine}{tail}");
-				}
-			}
 		}
 	}
 }
