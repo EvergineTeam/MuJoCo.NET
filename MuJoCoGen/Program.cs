@@ -27,6 +27,11 @@ namespace MuJoCoGen
 			// "mujoco" directory is what has to be on the include path.
 			options.IncludeFolders.Add(Path.Combine(AppContext.BaseDirectory, "Headers"));
 
+			// Stand-ins for <stdlib.h> and <math.h>. libclang ships freestanding headers but no
+			// libc, so without these the parse fails on a bare Linux runner and succeeds on
+			// Windows. See Headers/libc-stubs/stdlib.h.
+			options.IncludeFolders.Add(Path.Combine(AppContext.BaseDirectory, "Headers", "libc-stubs"));
+
 			// mjexport.h resolves MJAPI to __declspec(dllimport)/visibility attributes unless the
 			// static build is selected; MJ_STATIC keeps those out of the AST.
 			options.Defines.Add("MJ_STATIC");
