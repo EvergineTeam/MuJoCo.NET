@@ -1,0 +1,33 @@
+# Measures what a pull request does to the public contract of a package that ships 536
+# entry points and four native libraries.
+#
+# A diff of several thousand generated lines hides three things: which public symbols
+# moved, whether every P/Invoke still resolves in the libraries, and whether each library
+# matches the architecture its RID promises. The last two matter more here than usual,
+# because the agent that opens these pull requests runs the generator and never the
+# native download: regenerating against a newer header leaves the old libraries in place,
+# which reads as purely additive — new symbols, none removed — while every one of those
+# new symbols is missing from the binaries.
+#
+# auto-merge stays off. mjModel and mjData are parsed straight into blittable structs, so
+# a layout change is not a compile error anywhere; it is memory corruption in the
+# consumer's process.
+
+name: API Gate
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  api:
+    uses: EvergineTeam/Evergine.Bindings/.github/workflows/binding-api-gate.yml@v1
+    with:
+      binding-project: "Evergine.Bindings.MuJoCo/Evergine.Bindings.MuJoCo.csproj"
+      auto-merge: false
+      native-coherence: true
+      # mujoco.h reports its own version through mjVERSION_HEADER, which the generator
+      # emits as a const. Its value changes on every single release, so left alone the
+      # verdict would be "breaking" every time — which is the same as having no verdict.
+      exempt-symbols: |
+        mjVERSION_HEADER

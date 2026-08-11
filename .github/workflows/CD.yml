@@ -1,4 +1,10 @@
-# Binding Simple CD - Template
+# Tracked CD: resolve the MuJoCo release the manifest follows, lay out the native
+# libraries published for that same release, then regenerate, pack and publish.
+#
+# The natives job exists because upstream.assets cannot serve this repository: it only
+# unpacks zip and extracts flat. MuJoCo ships .tar.gz for both Linux RIDs, a .dmg for
+# macOS and a .zip for Windows whose members live under bin/, so none of the four could
+# land at runtimes/<rid>/native/ on its own.
 name: CD
 
 on:
@@ -9,11 +15,99 @@ on:
         required: false
         type: boolean
         default: false
+      force-publish:
+        description: 'Publish even when the generated code is unchanged'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
+  # Which MuJoCo release binding.yml currently follows, and whether it moved.
+  resolve:
+    uses: EvergineTeam/Evergine.Bindings/.github/workflows/binding-resolve-upstream.yml@v1
+
+  # Fetch the prebuilt libraries for the resolved release and stage them at their final
+  # repository paths, which is the whole mapping binding-tracked-cd performs when it
+  # merges the artifact over the working tree.
+  natives:
+    needs: resolve
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download and lay out the MuJoCo libraries
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve.outputs.resolved_ref }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/google-deepmind/mujoco/releases/download/${VERSION}"
+          dest="staged/Evergine.Bindings.MuJoCo/runtimes"
+          mkdir -p "$dest"/{win-x64,linux-x64,linux-arm64,osx}/native
+          mkdir -p tmp
+
+          echo "::group::win-x64"
+          curl -fsSL "$base/mujoco-${VERSION}-windows-x86_64.zip" -o tmp/win.zip
+          unzip -q -j tmp/win.zip '*/bin/mujoco.dll' -d "$dest/win-x64/native"
+          echo "::endgroup::"
+
+          # The archives carry libmujoco.so.<version> plus an unversioned symlink. Copy
+          # the real file under the plain name: DllImport("mujoco") probes libmujoco.so,
+          # and a dangling symlink in a NuGet package resolves to nothing.
+          for pair in "linux-x86_64:linux-x64" "linux-aarch64:linux-arm64"; do
+            asset="${pair%%:*}"; rid="${pair##*:}"
+            echo "::group::$rid"
+            curl -fsSL "$base/mujoco-${VERSION}-${asset}.tar.gz" -o "tmp/$rid.tgz"
+            mkdir -p "tmp/$rid" && tar -xzf "tmp/$rid.tgz" -C "tmp/$rid"
+            cp "$(find "tmp/$rid" -name 'libmujoco.so.*' -type f | head -1)" \
+               "$dest/$rid/native/libmujoco.so"
+            echo "::endgroup::"
+          done
+
+          # macOS is published only as a .dmg, which needs a macOS runner to mount. The
+          # PyPI wheel is a zip carrying the same universal2 binary, so one Linux job can
+          # produce all four RIDs. One file serves osx-x64 and osx-arm64 alike: the RID
+          # graph resolves both to the architecture-less `osx` folder.
+          echo "::group::osx"
+          wheel=$(curl -fsSL "https://pypi.org/pypi/mujoco/${VERSION}/json" \
+            | python3 -c "import json,sys; print(next(u['url'] for u in json.load(sys.stdin)['urls'] if 'macosx' in u['filename'] and 'arm64' in u['filename']))")
+          curl -fsSL "$wheel" -o tmp/mac.whl
+          mkdir -p tmp/mac && unzip -q tmp/mac.whl -d tmp/mac
+          cp "$(find tmp/mac -name 'libmujoco*.dylib' -type f | head -1)" \
+             "$dest/osx/native/libmujoco.dylib"
+          echo "::endgroup::"
+
+      # A missing or truncated library still uploads happily and would be committed and
+      # published as the absence of a platform.
+      - name: Verify every RID produced a library
+        shell: bash
+        run: |
+          set -euo pipefail
+          dest="staged/Evergine.Bindings.MuJoCo/runtimes"
+          status=0
+          for f in win-x64/native/mujoco.dll linux-x64/native/libmujoco.so \
+                   linux-arm64/native/libmujoco.so osx/native/libmujoco.dylib; do
+            path="$dest/$f"
+            size=$(stat -c%s "$path" 2>/dev/null || echo 0)
+            if [ "$size" -lt 1000000 ]; then
+              echo "::error::$f is $size bytes; expected a multi-megabyte library"
+              status=1
+            else
+              echo "  $f: $size bytes"
+            fi
+          done
+          exit $status
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mujoco-natives
+          path: staged/
+          # Not `warn`: an empty artifact would be merged over the working tree as no
+          # change at all, and the publish would ship the previous libraries.
+          if-no-files-found: error
+
   cd:
-    if: github.event_name != 'schedule' || github.ref == 'refs/heads/main'
-    uses: EvergineTeam/evergine-standards/.github/workflows/binding-simple-cd.yml@v2
+    needs: [resolve, natives]
+    uses: EvergineTeam/Evergine.Bindings/.github/workflows/binding-tracked-cd.yml@v1
     with:
       generator-project: "MuJoCoGen/MuJoCoGen.csproj"
       generator-name: "MuJoCoGen"
@@ -24,6 +118,10 @@ jobs:
       runtime-identifier: "linux-x64"
       build-configuration: "Release"
       revision: ${{ github.run_number }}
+      # Asked for only when the job actually produced them: requesting artifacts that
+      # were never uploaded fails the download and takes the publish with it.
+      natives-artifact-pattern: ${{ needs.natives.result == 'success' && 'mujoco-natives' || '' }}
+      force-publish: ${{ inputs.force-publish || false }}
       publish-enabled: ${{ !inputs.skip-assets-publishing }}
       enable-email-notifications: true
     secrets:

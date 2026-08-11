@@ -1,0 +1,68 @@
+# Binding manifest — see https://github.com/EvergineTeam/Evergine.Bindings
+toolbox: 1.25.0
+
+package:
+  id: Evergine.Bindings.MuJoCo
+  project: Evergine.Bindings.MuJoCo/Evergine.Bindings.MuJoCo.csproj
+  target-framework: net10.0
+  runtime-identifier: ""
+
+upstream:
+  kind: git-tree
+  language: c
+  project: https://github.com/google-deepmind/mujoco
+  version-from: git-release
+  release:
+    track: stable
+    current: "3.11.0"
+    repo: google-deepmind/mujoco
+  sources:
+    - repo: google-deepmind/mujoco
+      remote-path: include/mujoco
+      path: MuJoCoGen/Headers/mujoco
+      format: c-header
+
+generator:
+  project: MuJoCoGen/MuJoCoGen.csproj
+  name: MuJoCoGen
+  output:
+    - Evergine.Bindings.MuJoCo/Generated
+
+# NOTE — the headers are pinned to a release rather than a branch on purpose. MuJoCo
+# publishes prebuilt libraries per release, and mjModel/mjData are parsed straight out of
+# the headers into blittable structs. Generating from a header that is ahead of the shipped
+# library changes those layouts and produces memory corruption at run time, not a build
+# error. Keep `track: stable` so headers and binaries move as one revision.
+#
+# NOTE — `sources[].path` is MuJoCoGen/Headers/mujoco, not MuJoCoGen/Headers. Two
+# hand-written things live beside the vendored tree and must survive a fetch:
+#
+#   MuJoCoGen/Headers/mujoco_capi.h   the translation unit the generator actually parses
+#   MuJoCoGen/Headers/libc-stubs/     stand-ins for <stdlib.h> and the rest
+#
+# mujoco_capi.h undefines __cplusplus before including mujoco.h. CppAst always drives
+# libclang in C++ mode, and mjspec.h aliases mjString/mjIntVec to std::string/std::vector
+# under __cplusplus, which are not marshallable; only the C branch, where they are opaque
+# `void`, can be bound. The libc stubs exist because libclang ships no libc and finds no
+# include paths at all on a Linux runner, so without them the parse dies there while
+# succeeding on Windows. Neither reaches the output: only declarations under
+# Headers/mujoco/ are emitted.
+#
+# NOTE — a fetch will restore include/mujoco/mjrfilament.h, which was pruned locally
+# because mujoco.h does not include it. That is harmless: the generator only emits what its
+# translation unit reaches, so an unreferenced header changes nothing.
+#
+# NOTE — native libraries do NOT come through `upstream.assets`, and this is deliberate
+# rather than an oversight. That path only unpacks `zip` and extracts flat, with no
+# remapping. MuJoCo publishes .tar.gz for both Linux RIDs, a .dmg for macOS, and a .zip for
+# Windows whose members sit under bin/ rather than runtimes/<rid>/native/, so not one of
+# the four could land at its final path. They are fetched and laid out by the `natives` job
+# in CD instead and handed to binding-tracked-cd as artifacts.
+#
+# NOTE — runtimes/osx/native/ is not a typo and must not be split into osx-x64 and
+# osx-arm64. The dylib is a universal2 binary, and the RID graph resolves both osx-x64 and
+# osx-arm64 to the architecture-less `osx` folder, so one 9 MB file covers both. Verified by
+# publishing a probe app against the package for each RID. check-native-arch reports `osx`
+# as an unrecognised RID and warns; splitting it would be worse, because the architecture
+# reader rejects a fat binary whose slices disagree and that turns the warning into a hard
+# failure.
