@@ -8,6 +8,7 @@
 		<Company>Plain Concepts</Company>
 		<Description>Low-level bindings for MuJoCo used in Evergine</Description>
 		<RepositoryUrl>https://github.com/EvergineTeam/MuJoCo.NET</RepositoryUrl>
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
 		<PackageIcon>icon.png</PackageIcon>
 		<PackageReadmeFile>README.md</PackageReadmeFile>
 	</PropertyGroup>
@@ -23,6 +24,8 @@
 	<ItemGroup>
 		<None Include="..\icon.png" Pack="true" PackagePath="\" Visible="false" />
 		<None Include="..\README.md" Pack="true" PackagePath="\" Visible="false" />
+		<!-- MuJoCo is Apache-2.0; redistributing its binaries requires shipping the notice. -->
+		<None Include="..\THIRD-PARTY-LICENSE-mujoco.txt" Pack="true" PackagePath="\" Visible="false" />
 	</ItemGroup>
 
 </Project>
